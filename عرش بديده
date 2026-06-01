@@ -1,0 +1,939 @@
+import { useState, useEffect, useMemo, useCallback } from "react";
+
+// ═══════════════════════════════════════════════
+// SUPABASE
+// ═══════════════════════════════════════════════
+const SB_URL = "https://basxijccayjqtfhtfqga.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJhc3hpamNjYXlqcXRmaHRmcWdhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAxNzk0MTEsImV4cCI6MjA5NTc1NTQxMX0.tQ2c0MIBMqs7IANEul3zeB2j2A9pG2tdbY1jxHVdepY";
+const H = { "Content-Type":"application/json", "apikey":SB_KEY, "Authorization":`Bearer ${SB_KEY}`, "Prefer":"return=representation" };
+const db = {
+  get:   async (t,q="")  => { const r=await fetch(`${SB_URL}/rest/v1/${t}${q}`,{headers:H}); return r.json(); },
+  post:  async (t,b)     => { const r=await fetch(`${SB_URL}/rest/v1/${t}`,{method:"POST",headers:H,body:JSON.stringify(b)}); return r.json(); },
+  patch: async (t,f,b)   => { const r=await fetch(`${SB_URL}/rest/v1/${t}?${f}`,{method:"PATCH",headers:H,body:JSON.stringify(b)}); return r.json(); },
+  del:   async (t,f)     => { await fetch(`${SB_URL}/rest/v1/${t}?${f}`,{method:"DELETE",headers:H}); },
+};
+
+// ═══════════════════════════════════════════════
+// AUTH
+// ═══════════════════════════════════════════════
+const USERS = [
+  { username:"badida", password:"arsh2024",  role:"public",    label:"عضو عادي",   icon:"👤" },
+  { username:"ameen",  password:"Mal@2024",  role:"treasurer", label:"أمين المال", icon:"💼" },
+  { username:"rais",   password:"Rais@2024", role:"president", label:"الرئيس",     icon:"👑" },
+];
+const ROLES = {
+  public:    { canAddMember:false, canEditMember:false, canDeleteMember:false, canArchiveMember:false, canAddPayment:false, canAddDonation:false, canAddExpense:false, canDelete:false, canExempt:false, canExportPDF:false, canSettings:false },
+  treasurer: { canAddMember:false, canEditMember:false, canDeleteMember:false, canArchiveMember:false, canAddPayment:true,  canAddDonation:true,  canAddExpense:true,  canDelete:false, canExempt:false, canExportPDF:false, canSettings:false },
+  president: { canAddMember:true,  canEditMember:true,  canDeleteMember:true,  canArchiveMember:true,  canAddPayment:true,  canAddDonation:true,  canAddExpense:true,  canDelete:true,  canExempt:true,  canExportPDF:true,  canSettings:true  },
+};
+
+// ═══════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════
+const CY = () => new Date().getFullYear();
+const CS = () => new Date().getMonth() < 6 ? 1 : 2;
+const fmt = n => Number(n||0).toLocaleString("ar-DZ") + " دج";
+const fmtDate = d => d ? new Date(d).toLocaleDateString("ar-DZ") : "";
+const semLabel = (y,s) => `السداسي ${s===1?"الأول":"الثاني"} ${y}`;
+const START_YEAR = 2026;
+
+function generateSemesters() {
+  const list = [];
+  for (let y = START_YEAR; y <= START_YEAR + 48; y++) {
+    list.push({ year:y, semester:1, label:`السداسي الأول ${y}` });
+    list.push({ year:y, semester:2, label:`السداسي الثاني ${y}` });
+  }
+  return list;
+}
+
+function getSubRate(year, semester, rates) {
+  if (!rates||!rates.length) return 2000;
+  const valid = rates
+    .filter(r => r.effective_year < year || (r.effective_year===year && r.effective_semester<=semester))
+    .sort((a,b) => b.effective_year-a.effective_year || b.effective_semester-a.effective_semester);
+  return valid.length ? valid[0].amount : 2000;
+}
+
+function getMemberSemPaid(memberId, year, semester, payments) {
+  return payments
+    .filter(p => p.member_id===memberId && p.year===year && p.semester===semester)
+    .reduce((s,p) => s+p.base, 0);
+}
+
+function getMemberDebt(member, payments, exemptions, rates) {
+  let debt = 0;
+  const curY=CY(), curS=CS();
+  const startY = Math.max(member.join_year, START_YEAR);
+  for (let y=startY; y<=curY; y++) {
+    for (let s=1; s<=2; s++) {
+      if (y===member.join_year && s<member.join_semester) continue;
+      if (y===curY && s>curS) continue;
+      if (exemptions.some(e=>e.member_id===member.id&&e.year===y&&e.semester===s)) continue;
+      const paid = getMemberSemPaid(member.id, y, s, payments);
+      const rate = getSubRate(y, s, rates);
+      if (paid < rate) debt += (rate - paid);
+    }
+  }
+  return debt;
+}
+
+function getMemberStatus(member, year, semester, payments, exemptions, rates) {
+  const curY=CY(), curS=CS();
+  if (year>curY||(year===curY&&semester>curS)) return "future";
+  if (year<member.join_year||(year===member.join_year&&semester<member.join_semester)) return "inactive";
+  if (exemptions.some(e=>e.member_id===member.id&&e.year===year&&e.semester===semester)) return "exempt";
+  const paid = getMemberSemPaid(member.id, year, semester, payments);
+  const rate = getSubRate(year, semester, rates);
+  if (paid>=rate) return "committed";
+  if (paid>0) return "partial";
+  return "late";
+}
+
+const STATUS = {
+  committed:{ label:"ملتزم",      color:"#4ade80", bg:"#052e16", emoji:"🟢" },
+  partial:  { label:"جزئي",       color:"#fbbf24", bg:"#451a03", emoji:"🟡" },
+  late:     { label:"متأخر",      color:"#f87171", bg:"#3b0a0a", emoji:"🔴" },
+  exempt:   { label:"معفى",       color:"#94a3b8", bg:"#1e293b", emoji:"⚪" },
+  inactive: { label:"غير مطالب", color:"#475569", bg:"#0f172a", emoji:"➖" },
+  future:   { label:"لم يحن",     color:"#475569", bg:"#0f172a", emoji:"➖" },
+};
+
+// ═══════════════════════════════════════════════
+// PDF
+// ═══════════════════════════════════════════════
+function exportPDF(members, payments, donations, expenses, exemptions, rates, openingBal) {
+  const curY=CY(),curS=CS();
+  const active=members.filter(m=>m.status==="active");
+  const tB=payments.reduce((s,p)=>s+p.base,0),tD=donations.reduce((s,d)=>s+d.amount,0),tE=expenses.reduce((s,e)=>s+e.amount,0);
+  const net=(openingBal||0)+tB+tD-tE;
+  let h=`<!DOCTYPE html><html dir="rtl"><head><meta charset="UTF-8"><title>تقرير صندوق التكافل</title>
+  <style>body{font-family:Arial,sans-serif;direction:rtl;padding:28px;color:#1e293b;font-size:12px}
+  h1{color:#1d4ed8;font-size:18px;margin-bottom:2px}h2{font-size:13px;border-bottom:2px solid #1d4ed8;padding-bottom:3px;margin-top:20px}
+  table{width:100%;border-collapse:collapse;margin-top:7px}th{background:#1d4ed8;color:#fff;padding:6px 9px;text-align:right;font-size:11px}
+  td{padding:5px 9px;border-bottom:1px solid #e2e8f0;font-size:11px}tr:nth-child(even){background:#f8fafc}
+  .stats{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.s{background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:7px 12px;text-align:center;flex:1}
+  .sv{font-size:13px;font-weight:700;color:#1d4ed8}.sl{font-size:10px;color:#64748b}
+  .footer{margin-top:18px;color:#94a3b8;font-size:10px;border-top:1px solid #e2e8f0;padding-top:8px;text-align:center}</style>
+  </head><body>
+  <h1>📋 تقرير صندوق التكافل الاجتماعي — عرش بديده</h1>
+  <p style="color:#64748b;font-size:10px">تاريخ التصدير: ${new Date().toLocaleDateString("ar-DZ")} | ${semLabel(curY,curS)}</p>
+  <div class="stats">
+    <div class="s"><div class="sv">${net.toLocaleString("ar-DZ")} دج</div><div class="sl">الرصيد الصافي</div></div>
+    <div class="s"><div class="sv">${tB.toLocaleString("ar-DZ")} دج</div><div class="sl">الاشتراكات</div></div>
+    <div class="s"><div class="sv">${tD.toLocaleString("ar-DZ")} دج</div><div class="sl">التبرعات</div></div>
+    <div class="s"><div class="sv">${tE.toLocaleString("ar-DZ")} دج</div><div class="sl">المصاريف</div></div>
+  </div>
+  <h2>👥 حالة الأعضاء — ${semLabel(curY,curS)}</h2>
+  <table><tr><th>#</th><th>الاسم</th><th>الإقامة</th><th>الحالة</th><th>المدفوع</th><th>المديونية</th></tr>`;
+  active.forEach((m,i)=>{
+    const st=getMemberStatus(m,curY,curS,payments,exemptions,rates);
+    const paid=getMemberSemPaid(m.id,curY,curS,payments);
+    const debt=getMemberDebt(m,payments,exemptions,rates);
+    const stI=STATUS[st];
+    h+=`<tr><td>${i+1}</td><td><b>${m.name}</b></td><td>${m.location||""}</td><td style="color:${stI.color}">${stI.emoji} ${stI.label}</td><td>${paid.toLocaleString("ar-DZ")} دج</td><td style="color:${debt>0?"#ef4444":"#22c55e"};font-weight:700">${debt>0?debt.toLocaleString("ar-DZ")+" دج":"✅ لا ديون"}</td></tr>`;
+  });
+  h+=`</table><h2>💸 المصاريف</h2><table><tr><th>التاريخ</th><th>المناسبة</th><th>المستفيد</th><th>المبلغ</th><th>ملاحظات</th></tr>`;
+  expenses.forEach(e=>{ h+=`<tr><td>${fmtDate(e.date)}</td><td>${e.type}</td><td>${e.beneficiary}</td><td>${e.amount.toLocaleString("ar-DZ")} دج</td><td>${e.note||""}</td></tr>`; });
+  h+=`</table><h2>🎁 التبرعات</h2><table><tr><th>التاريخ</th><th>المتبرع</th><th>المبلغ</th><th>ملاحظات</th></tr>`;
+  donations.forEach(d=>{ h+=`<tr><td>${fmtDate(d.date)}</td><td>${d.donor_name}</td><td>${d.amount.toLocaleString("ar-DZ")} دج</td><td>${d.note||""}</td></tr>`; });
+  h+=`</table><div class="footer">صندوق التكافل الاجتماعي — عرش بديده © ${curY}</div></body></html>`;
+  const w=window.open("","_blank"); w.document.write(h); w.document.close(); setTimeout(()=>w.print(),800);
+}
+
+// ═══════════════════════════════════════════════
+// STYLES
+// ═══════════════════════════════════════════════
+const inp = { width:"100%", background:"#0d1f35", border:"1px solid #1e3a5f", borderRadius:"8px", padding:"10px 14px", color:"#e2e8f0", fontSize:"0.88rem", outline:"none", boxSizing:"border-box", direction:"rtl", fontFamily:"'Tajawal',sans-serif" };
+const Btn = (c="#1d4ed8",ghost=false) => ({ background:ghost?`${c}18`:`linear-gradient(135deg,${c},${c}cc)`, border:`1px solid ${ghost?c+"55":c}`, color:ghost?c:"#fff", padding:"9px 16px", borderRadius:"9px", cursor:"pointer", display:"inline-flex", alignItems:"center", gap:"6px", fontSize:"0.82rem", fontFamily:"'Tajawal',sans-serif", whiteSpace:"nowrap" });
+const Card = (b="#1e3a5f") => ({ background:"linear-gradient(145deg,#0a1628,#0d1f35)", border:`1px solid ${b}`, borderRadius:"16px", padding:"18px" });
+const TH = { padding:"10px 12px", textAlign:"right", color:"#4a6fa5", fontSize:"0.73rem", fontWeight:"600", borderBottom:"1px solid #0d1f35", background:"#06101e", whiteSpace:"nowrap" };
+const TD = i => ({ padding:"10px 12px", borderBottom:"1px solid #0a1525", background:i%2===0?"#080e1c":"#060c18", verticalAlign:"middle" });
+
+// ═══════════════════════════════════════════════
+// COMPONENTS
+// ═══════════════════════════════════════════════
+function Modal({ title, onClose, children, wide }) {
+  return (
+    <div style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:"12px",backdropFilter:"blur(8px)" }}>
+      <div style={{ background:"linear-gradient(145deg,#080f1e,#0d1930)",border:"1px solid #1e3a5f",borderRadius:"18px",width:"100%",maxWidth:wide?"700px":"480px",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 40px 100px rgba(0,0,0,0.95)" }}>
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 22px",borderBottom:"1px solid #1e3a5f",background:"#060e1c" }}>
+          <span style={{ color:"#93c5fd",fontSize:"0.92rem",fontWeight:"700" }}>{title}</span>
+          <button onClick={onClose} style={{ background:"#1e293b",border:"1px solid #334155",color:"#64748b",cursor:"pointer",padding:"3px 9px",borderRadius:"6px" }}>✕</button>
+        </div>
+        <div style={{ padding:"20px" }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom:"13px" }}>
+      <label style={{ display:"block",color:"#4a6fa5",fontSize:"0.73rem",marginBottom:"5px",fontWeight:"600" }}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function Badge({ status }) {
+  const s=STATUS[status]||STATUS.inactive;
+  return <span style={{ background:s.bg,color:s.color,padding:"3px 10px",borderRadius:"20px",fontSize:"0.7rem",border:`1px solid ${s.color}33`,whiteSpace:"nowrap",display:"inline-block" }}>{s.emoji} {s.label}</span>;
+}
+
+function Confirm({ msg, onYes, onNo, danger }) {
+  return (
+    <Modal title={danger?"⚠️ تحذير — حذف نهائي":"⚠️ تأكيد"} onClose={onNo}>
+      {danger && <div style={{ background:"#3b0a0a",border:"1px solid #ef4444",borderRadius:"8px",padding:"10px 14px",marginBottom:"16px",color:"#fca5a5",fontSize:"0.8rem" }}>
+        ⚠️ هذا الإجراء لا يمكن التراجع عنه — ستُحذف كل بيانات العضو نهائياً
+      </div>}
+      <p style={{ color:"#cbd5e1",marginBottom:"22px",lineHeight:"1.8",fontSize:"0.88rem" }}>{msg}</p>
+      <div style={{ display:"flex",gap:"10px" }}>
+        <button onClick={onYes} style={Btn(danger?"#ef4444":"#1d4ed8")}>{danger?"حذف نهائياً":"تأكيد"}</button>
+        <button onClick={onNo} style={Btn("#334155")}>إلغاء</button>
+      </div>
+    </Modal>
+  );
+}
+
+function Toast({ msg, type }) {
+  return (
+    <div style={{ position:"fixed",top:"16px",left:"50%",transform:"translateX(-50%)",background:type==="error"?"#3b0a0a":"#052e16",border:`1px solid ${type==="error"?"#ef4444":"#22c55e"}`,color:type==="error"?"#f87171":"#4ade80",padding:"10px 24px",borderRadius:"30px",zIndex:2000,fontSize:"0.83rem",boxShadow:"0 8px 30px rgba(0,0,0,0.7)",whiteSpace:"nowrap" }}>
+      {msg}
+    </div>
+  );
+}
+
+function Loader() {
+  return (
+    <div style={{ display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#04090f",gap:"18px" }}>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <div style={{ width:"44px",height:"44px",border:"3px solid #1e3a5f",borderTop:"3px solid #3b82f6",borderRadius:"50%",animation:"spin 0.8s linear infinite" }}/>
+      <p style={{ color:"#4a6fa5",fontSize:"0.83rem" }}>جاري تحميل البيانات...</p>
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, color, icon }) {
+  return (
+    <div style={{ ...Card(`${color}33`),position:"relative",overflow:"hidden" }}>
+      <div style={{ position:"absolute",top:"-18px",left:"-18px",width:"80px",height:"80px",borderRadius:"50%",background:`${color}10` }}/>
+      <div style={{ fontSize:"1.4rem",marginBottom:"6px" }}>{icon}</div>
+      <div style={{ color:"#4a6fa5",fontSize:"0.7rem",marginBottom:"4px",fontWeight:"600" }}>{label}</div>
+      <div style={{ color:"#f1f5f9",fontSize:"1.3rem",fontWeight:"900" }}>{value}</div>
+      {sub && <div style={{ color:"#334155",fontSize:"0.66rem",marginTop:"3px" }}>{sub}</div>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════
+// LOGIN SCREEN
+// ═══════════════════════════════════════════════
+function LoginScreen({ onLogin }) {
+  const [f, setF] = useState({ user:"", pass:"", error:"", loading:false });
+  const set = (k,v) => setF(p=>({...p,[k]:v}));
+
+  function handleLogin() {
+    if (!f.user||!f.pass) { set("error","يرجى ملء جميع الحقول"); return; }
+    set("loading",true);
+    setTimeout(()=>{
+      const found = USERS.find(u=>u.username===f.user&&u.password===f.pass);
+      if (found) onLogin(found);
+      else setF(p=>({...p,error:"اسم المستخدم أو كلمة المرور غير صحيحة",loading:false}));
+    },600);
+  }
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#04090f", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"20px", fontFamily:"'Tajawal',sans-serif", direction:"rtl" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        input:focus{border-color:#3b82f6!important;box-shadow:0 0 0 2px #3b82f620!important;outline:none}
+      `}</style>
+
+      {/* شعار وعنوان */}
+      <div style={{ textAlign:"center", marginBottom:"40px", animation:"fadeUp 0.6s ease" }}>
+        <div style={{ width:"80px", height:"80px", borderRadius:"20px", background:"linear-gradient(135deg,#1d4ed8,#0ea5e9)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:"36px", margin:"0 auto 16px", boxShadow:"0 20px 60px #1d4ed840" }}>🛡️</div>
+        <h1 style={{ color:"#f1f5f9", fontSize:"1.8rem", fontWeight:"900", marginBottom:"4px" }}>صندوق التكافل الاجتماعي</h1>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:"8px", marginBottom:"6px" }}>
+          <div style={{ height:"1px", width:"40px", background:"linear-gradient(90deg,transparent,#1e3a5f)" }}/>
+          <span style={{ color:"#3b82f6", fontSize:"1rem", fontWeight:"700" }}>عرش بديده</span>
+          <div style={{ height:"1px", width:"40px", background:"linear-gradient(90deg,#1e3a5f,transparent)" }}/>
+        </div>
+        <p style={{ color:"#334155", fontSize:"0.78rem" }}>منظومة إدارة الصندوق — تأسس {START_YEAR}</p>
+      </div>
+
+      {/* بطاقة تسجيل الدخول */}
+      <div style={{ width:"100%", maxWidth:"400px", background:"linear-gradient(145deg,#0a1628,#0d1f35)", border:"1px solid #1e3a5f", borderRadius:"20px", padding:"32px 28px", boxShadow:"0 30px 80px rgba(0,0,0,0.8)", animation:"fadeUp 0.8s ease" }}>
+        <h2 style={{ color:"#93c5fd", fontSize:"1.1rem", fontWeight:"700", marginBottom:"6px", textAlign:"center" }}>تسجيل الدخول</h2>
+        <p style={{ color:"#1e3a5f", fontSize:"0.73rem", textAlign:"center", marginBottom:"24px" }}>أدخل بيانات حسابك للمتابعة</p>
+
+        <Field label="اسم المستخدم">
+          <input style={inp} value={f.user} onChange={e=>set("user",e.target.value)}
+            placeholder="أدخل اسم المستخدم" onKeyDown={e=>e.key==="Enter"&&handleLogin()}/>
+        </Field>
+        <Field label="كلمة المرور">
+          <input style={inp} type="password" value={f.pass} onChange={e=>set("pass",e.target.value)}
+            placeholder="أدخل كلمة المرور" onKeyDown={e=>e.key==="Enter"&&handleLogin()}/>
+        </Field>
+
+        {f.error && (
+          <div style={{ background:"#3b0a0a", border:"1px solid #ef444444", borderRadius:"8px", padding:"8px 12px", marginBottom:"14px", color:"#f87171", fontSize:"0.78rem", textAlign:"center" }}>
+            ⚠️ {f.error}
+          </div>
+        )}
+
+        <button onClick={handleLogin} disabled={f.loading} style={{ ...Btn(), width:"100%", justifyContent:"center", padding:"12px", fontSize:"0.9rem", opacity:f.loading?0.7:1 }}>
+          {f.loading ? (
+            <><div style={{ width:"16px",height:"16px",border:"2px solid #ffffff44",borderTop:"2px solid #fff",borderRadius:"50%",animation:"spin 0.8s linear infinite" }}/> جاري الدخول...</>
+          ) : "دخول →"}
+        </button>
+
+        {/* معلومات الحسابات */}
+        <div style={{ marginTop:"20px", borderTop:"1px solid #0d1f35", paddingTop:"16px" }}>
+          <p style={{ color:"#1e3a5f", fontSize:"0.68rem", textAlign:"center", marginBottom:"10px" }}>الحسابات المتاحة</p>
+          <div style={{ display:"flex", flexDirection:"column", gap:"6px" }}>
+            {[
+              { icon:"👤", role:"العموم",    user:"badida", desc:"عرض فقط" },
+              { icon:"💼", role:"أمين المال", user:"ameen",  desc:"تسجيل دفعات ومصاريف" },
+              { icon:"👑", role:"الرئيس",    user:"rais",   desc:"كامل الصلاحيات" },
+            ].map(u=>(
+              <div key={u.user} style={{ display:"flex", alignItems:"center", gap:"10px", background:"#060c18", borderRadius:"8px", padding:"8px 12px" }}>
+                <span style={{ fontSize:"1rem" }}>{u.icon}</span>
+                <div style={{ flex:1 }}>
+                  <div style={{ color:"#64748b", fontSize:"0.72rem", fontWeight:"700" }}>{u.role}</div>
+                  <div style={{ color:"#334155", fontSize:"0.65rem" }}>{u.desc}</div>
+                </div>
+                <span style={{ color:"#1e3a5f", fontSize:"0.65rem", fontFamily:"monospace" }}>{u.user}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <p style={{ color:"#0d1f35", fontSize:"0.65rem", marginTop:"24px", textAlign:"center" }}>
+        صندوق التكافل الاجتماعي — عرش بديده © {CY()}
+      </p>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════
+export default function App() {
+  const [user,       setUser]       = useState(null);
+  const [members,    setMembers]    = useState([]);
+  const [payments,   setPayments]   = useState([]);
+  const [donations,  setDonations]  = useState([]);
+  const [expenses,   setExpenses]   = useState([]);
+  const [exemptions, setExemptions] = useState([]);
+  const [rates,      setRates]      = useState([]);
+  const [openingBal, setOpeningBal] = useState(0);
+  const [openingId,  setOpeningId]  = useState(null);
+  const [auditLog,   setAuditLog]   = useState([]);
+  const [loading,    setLoading]    = useState(false);
+  const [saving,     setSaving]     = useState(false);
+  const [view,       setView]       = useState("dashboard");
+  const [modal,      setModal]      = useState(null);
+  const [selMem,     setSelMem]     = useState(null);
+  const [confirm,    setConfirm]    = useState(null);
+  const [search,     setSearch]     = useState("");
+  const [filterS,    setFilterS]    = useState({ year:CY(), semester:CS() });
+  const [toast,      setToast]      = useState(null);
+
+  const semesters = useMemo(()=>generateSemesters(),[]);
+  const perms = user ? ROLES[user.role] : ROLES.public;
+
+  const showToast = (msg,type="success") => { setToast({msg,type}); setTimeout(()=>setToast(null),3000); };
+
+  const loadAll = useCallback(async()=>{
+    setLoading(true);
+    try {
+      const [m,p,d,e,ex,r,ob,al] = await Promise.all([
+        db.get("members","?order=id"),
+        db.get("payments","?order=created_at.desc"),
+        db.get("donations","?order=created_at.desc"),
+        db.get("expenses","?order=date.desc"),
+        db.get("exemptions","?order=id"),
+        db.get("subscription_rates","?order=effective_year,effective_semester"),
+        db.get("opening_balance","?limit=1"),
+        db.get("audit_log","?order=created_at.desc&limit=100"),
+      ]);
+      if(Array.isArray(m))  setMembers(m);
+      if(Array.isArray(p))  setPayments(p);
+      if(Array.isArray(d))  setDonations(d);
+      if(Array.isArray(e))  setExpenses(e);
+      if(Array.isArray(ex)) setExemptions(ex);
+      if(Array.isArray(r))  setRates(r);
+      if(Array.isArray(ob)&&ob[0]){ setOpeningBal(ob[0].amount); setOpeningId(ob[0].id); }
+      if(Array.isArray(al)) setAuditLog(al);
+    } catch{ showToast("فشل الاتصال بقاعدة البيانات","error"); }
+    setLoading(false);
+  },[]);
+
+  useEffect(()=>{ if(user) loadAll(); },[user,loadAll]);
+
+  const addAudit = async(action)=>{ try{ await db.post("audit_log",{user_label:user?.label||"نظام",action}); }catch{} };
+
+  const totalBase=payments.reduce((s,p)=>s+p.base,0);
+  const totalDon=donations.reduce((s,d)=>s+d.amount,0);
+  const totalExp=expenses.reduce((s,e)=>s+e.amount,0);
+  const netBal=openingBal+totalBase+totalDon-totalExp;
+  const curRate=getSubRate(CY(),CS(),rates);
+  const activeMembers=members.filter(m=>m.status==="active");
+
+  const memberRows=useMemo(()=>
+    activeMembers
+      .map(m=>({...m,
+        status:getMemberStatus(m,filterS.year,filterS.semester,payments,exemptions,rates),
+        semPaid:getMemberSemPaid(m.id,filterS.year,filterS.semester,payments),
+        totalDebt:getMemberDebt(m,payments,exemptions,rates)
+      }))
+      .filter(m=>!search||m.name.includes(search)||(m.location||"").includes(search))
+  ,[members,payments,exemptions,rates,filterS,search]);
+
+  const committed=memberRows.filter(m=>m.status==="committed").length;
+  const partial=memberRows.filter(m=>m.status==="partial").length;
+  const late=memberRows.filter(m=>m.status==="late").length;
+  const exempt=memberRows.filter(m=>m.status==="exempt").length;
+
+  // ── CRUD ──
+  async function addMember(f){ setSaving(true); const res=await db.post("members",f); if(Array.isArray(res)&&res[0]){setMembers(p=>[...p,res[0]]);await addAudit(`إضافة عضو: ${f.name}`);showToast("تم إضافة العضو ✅");setModal(null);}else showToast("حدث خطأ","error"); setSaving(false); }
+  async function editMember(f){ setSaving(true); await db.patch("members",`id=eq.${selMem.id}`,f); setMembers(p=>p.map(m=>m.id===selMem.id?{...m,...f}:m)); await addAudit(`تعديل بيانات: ${selMem.name}`); showToast("تم التعديل ✅"); setModal(null); setSaving(false); }
+
+  function deleteMember(m){
+    setConfirm({ danger:true, msg:`هل تريد حذف العضو "${m.name}" نهائياً؟ ستُحذف جميع دفعاته وبياناته ولا يمكن التراجع.`,
+      onYes:async()=>{
+        await db.del("payments",`member_id=eq.${m.id}`);
+        await db.del("exemptions",`member_id=eq.${m.id}`);
+        await db.del("members",`id=eq.${m.id}`);
+        setMembers(p=>p.filter(x=>x.id!==m.id));
+        setPayments(p=>p.filter(x=>x.member_id!==m.id));
+        setExemptions(p=>p.filter(x=>x.member_id!==m.id));
+        await addAudit(`حذف نهائي للعضو: ${m.name}`);
+        showToast("تم الحذف النهائي");
+        setConfirm(null);
+      }
+    });
+  }
+
+  function archiveMember(m){
+    setConfirm({ msg:`نقل "${m.name}" إلى الأرشيف؟ سيبقى سجله محفوظاً.`,
+      onYes:async()=>{ await db.patch("members",`id=eq.${m.id}`,{status:"archived"}); setMembers(p=>p.map(x=>x.id===m.id?{...x,status:"archived"}:x)); await addAudit(`أرشفة: ${m.name}`); showToast("تم النقل للأرشيف"); setConfirm(null); }
+    });
+  }
+
+  async function addPayment(f){ setSaving(true); const res=await db.post("payments",f); if(Array.isArray(res)&&res[0]){setPayments(p=>[res[0],...p]);const mn=members.find(m=>m.id===f.member_id);await addAudit(`دفعة ${fmt(f.base)} لـ ${mn?.name} — ${semLabel(f.year,f.semester)}`);showToast("تم تسجيل الدفعة ✅");setModal(null);}else showToast("حدث خطأ","error"); setSaving(false); }
+  function deletePayment(p){ const mn=members.find(m=>m.id===p.member_id); setConfirm({msg:`حذف دفعة ${fmt(p.base)} لـ ${mn?.name}؟`,onYes:async()=>{await db.del("payments",`id=eq.${p.id}`);setPayments(prev=>prev.filter(x=>x.id!==p.id));await addAudit(`حذف دفعة لـ ${mn?.name}`);showToast("تم الحذف");setConfirm(null);}}); }
+
+  async function addDonation(f){ setSaving(true); const res=await db.post("donations",f); if(Array.isArray(res)&&res[0]){setDonations(p=>[res[0],...p]);await addAudit(`تبرع ${fmt(f.amount)} من ${f.donor_name}`);showToast("تم تسجيل التبرع ✅");setModal(null);}else showToast("حدث خطأ","error"); setSaving(false); }
+  function deleteDonation(d){ setConfirm({msg:`حذف تبرع ${fmt(d.amount)} من ${d.donor_name}؟`,onYes:async()=>{await db.del("donations",`id=eq.${d.id}`);setDonations(prev=>prev.filter(x=>x.id!==d.id));await addAudit(`حذف تبرع من ${d.donor_name}`);showToast("تم الحذف");setConfirm(null);}}); }
+
+  async function addExpense(f){ setSaving(true); const res=await db.post("expenses",f); if(Array.isArray(res)&&res[0]){setExpenses(p=>[res[0],...p]);await addAudit(`مصروف ${fmt(f.amount)} — ${f.type} — ${f.beneficiary}`);showToast("تم تسجيل المصروف ✅");setModal(null);}else showToast("حدث خطأ","error"); setSaving(false); }
+  function deleteExpense(e){ setConfirm({msg:`حذف مصروف ${fmt(e.amount)} لـ ${e.beneficiary}؟`,onYes:async()=>{await db.del("expenses",`id=eq.${e.id}`);setExpenses(prev=>prev.filter(x=>x.id!==e.id));await addAudit(`حذف مصروف لـ ${e.beneficiary}`);showToast("تم الحذف");setConfirm(null);}}); }
+
+  async function addExemption(f){ setSaving(true); const res=await db.post("exemptions",f); if(Array.isArray(res)&&res[0]){setExemptions(p=>[...p,res[0]]);const mn=members.find(m=>m.id===f.member_id);await addAudit(`إعفاء لـ ${mn?.name} — ${semLabel(f.year,f.semester)}`);showToast("تم منح الإعفاء ✅");setModal(null);}else showToast("الإعفاء موجود مسبقاً أو حدث خطأ","error"); setSaving(false); }
+  function removeExemption(ex){ const mn=members.find(m=>m.id===ex.member_id); setConfirm({msg:`إلغاء إعفاء ${mn?.name}؟`,onYes:async()=>{await db.del("exemptions",`id=eq.${ex.id}`);setExemptions(prev=>prev.filter(x=>x.id!==ex.id));await addAudit(`إلغاء إعفاء ${mn?.name}`);showToast("تم الإلغاء");setConfirm(null);}}); }
+
+  async function saveSettings(f){ setSaving(true); await db.patch("opening_balance",`id=eq.${openingId}`,{amount:Number(f.opening),updated_at:new Date().toISOString()}); setOpeningBal(Number(f.opening)); if(Number(f.newRate)!==curRate){const res=await db.post("subscription_rates",{amount:Number(f.newRate),effective_year:Number(f.rateYear),effective_semester:Number(f.rateSem),note:f.rateNote||`تعديل إلى ${f.newRate} دج`}); if(Array.isArray(res)&&res[0]) setRates(p=>[...p,res[0]]); await addAudit(`تغيير قيمة الاشتراك إلى ${fmt(f.newRate)} من ${semLabel(f.rateYear,f.rateSem)}`);} showToast("تم حفظ الإعدادات ✅"); setSaving(false); setModal(null); }
+
+  if (!user) return <LoginScreen onLogin={u=>{ setUser(u); }}/>;
+  if (loading) return <Loader/>;
+
+  const NAV=[
+    {id:"dashboard",label:"🏠 الرئيسية"},
+    {id:"members",label:"👥 الأعضاء"},
+    {id:"expenses",label:"💸 المصاريف"},
+    {id:"donations",label:"🎁 التبرعات"},
+    {id:"archive",label:"🗄️ الأرشيف"},
+    ...(perms.canExportPDF?[{id:"yearly",label:"📊 التقرير"},{id:"audit",label:"📋 السجل"}]:[]),
+  ];
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#04090f", color:"#e2e8f0", fontFamily:"'Tajawal',sans-serif", direction:"rtl" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:#04090f}::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:2px}
+        button:hover{filter:brightness(1.12)} input:focus,select:focus{border-color:#3b82f6!important}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}.fade{animation:fadeUp 0.25s ease}
+        tr:hover td{background:#0d1f35!important;transition:background 0.15s}
+      `}</style>
+
+      {toast && <Toast msg={toast.msg} type={toast.type}/>}
+
+      {/* HEADER */}
+      <header style={{ background:"#04090f", borderBottom:"1px solid #0d1f35", padding:"0 14px", position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ maxWidth:"1400px", margin:"0 auto", display:"flex", alignItems:"center", justifyContent:"space-between", height:"56px", gap:"8px" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:"8px", flexShrink:0 }}>
+            <div style={{ width:"32px", height:"32px", borderRadius:"8px", background:"linear-gradient(135deg,#1d4ed8,#0ea5e9)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:"15px" }}>🛡️</div>
+            <div>
+              <div style={{ fontSize:"0.85rem", fontWeight:"900", color:"#e2e8f0", lineHeight:1.1 }}>صندوق التكافل</div>
+              <div style={{ fontSize:"0.58rem", color:"#3b82f6", fontWeight:"700" }}>عرش بديده</div>
+            </div>
+          </div>
+
+          <nav style={{ display:"flex", gap:"1px", overflowX:"auto", flexShrink:1 }}>
+            {NAV.map(n=>(
+              <button key={n.id} onClick={()=>setView(n.id)} style={{ background:view===n.id?"#1d4ed8":"none", border:view===n.id?"1px solid #3b82f6":"1px solid transparent", color:view===n.id?"#fff":"#4a6fa5", padding:"4px 9px", borderRadius:"7px", fontSize:"0.72rem", whiteSpace:"nowrap", cursor:"pointer" }}>{n.label}</button>
+            ))}
+          </nav>
+
+          <div style={{ display:"flex", gap:"6px", alignItems:"center", flexShrink:0 }}>
+            {perms.canSettings && <button onClick={()=>setModal("settings")} style={{ ...Btn("#475569",true), padding:"4px 9px" }}>⚙️</button>}
+            <button onClick={loadAll} style={{ ...Btn("#334155",true), padding:"4px 9px", fontSize:"0.7rem" }}>🔄</button>
+            <div style={{ display:"flex", alignItems:"center", gap:"6px", background:"#0d1f35", border:"1px solid #1e3a5f", borderRadius:"20px", padding:"4px 12px" }}>
+              <span style={{ fontSize:"0.8rem" }}>{user.icon}</span>
+              <span style={{ fontSize:"0.72rem", color:"#93c5fd", fontWeight:"700" }}>{user.label}</span>
+            </div>
+            <button onClick={()=>{ setUser(null); setView("dashboard"); }} style={{ ...Btn("#334155"), padding:"4px 9px", fontSize:"0.7rem" }}>خروج</button>
+          </div>
+        </div>
+      </header>
+
+      <main style={{ maxWidth:"1400px", margin:"0 auto", padding:"18px 12px" }}>
+
+        {/* DASHBOARD */}
+        {view==="dashboard" && (
+          <div className="fade">
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:"18px", flexWrap:"wrap", gap:"10px" }}>
+              <div>
+                <h1 style={{ fontSize:"1.3rem", color:"#f1f5f9", fontWeight:"900" }}>لوحة المتابعة</h1>
+                <p style={{ color:"#1e3a5f", fontSize:"0.75rem" }}>{semLabel(CY(),CS())} — بيانات مباشرة</p>
+              </div>
+              {perms.canExportPDF && <button onClick={()=>exportPDF(members,payments,donations,expenses,exemptions,rates,openingBal)} style={{ ...Btn("#1d4ed8",true), fontSize:"0.75rem" }}>🖨️ طباعة تقرير</button>}
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(175px,1fr))", gap:"12px", marginBottom:"18px" }}>
+              <StatCard label="الرصيد الصافي" value={fmt(netBal)} color="#4ade80" icon="💰" sub="= اشتراكات + تبرعات - مصاريف"/>
+              <StatCard label="الاشتراكات" value={fmt(totalBase)} color="#38bdf8" icon="📥" sub={`${payments.length} دفعة`}/>
+              <StatCard label="التبرعات" value={fmt(totalDon)} color="#a78bfa" icon="🎁" sub={`${donations.length} تبرع`}/>
+              <StatCard label="المصاريف" value={fmt(totalExp)} color="#f87171" icon="📤" sub={`${expenses.length} عملية`}/>
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))", gap:"12px", marginBottom:"18px" }}>
+              <div style={Card()}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"12px", flexWrap:"wrap", gap:"6px" }}>
+                  <span style={{ color:"#93c5fd", fontSize:"0.82rem", fontWeight:"700" }}>الالتزام</span>
+                  <select style={{ ...inp, width:"auto", padding:"4px 10px", fontSize:"0.72rem" }}
+                    value={`${filterS.year}-${filterS.semester}`}
+                    onChange={e=>{ const [y,s]=e.target.value.split("-"); setFilterS({year:Number(y),semester:Number(s)}); }}>
+                    {semesters.filter(s=>s.year<=CY()+1).map(s=>(
+                      <option key={`${s.year}-${s.semester}`} value={`${s.year}-${s.semester}`}>{s.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"6px" }}>
+                  {[{l:"ملتزم 🟢",c:committed,color:"#4ade80"},{l:"جزئي 🟡",c:partial,color:"#fbbf24"},{l:"متأخر 🔴",c:late,color:"#f87171"},{l:"معفى ⚪",c:exempt,color:"#94a3b8"}].map(x=>(
+                    <div key={x.l} style={{ background:"#060c18", borderRadius:"8px", padding:"10px", textAlign:"center", border:`1px solid ${x.color}22` }}>
+                      <div style={{ fontSize:"1.5rem", fontWeight:"900", color:x.color }}>{x.c}</div>
+                      <div style={{ fontSize:"0.66rem", color:"#334155", marginTop:"2px" }}>{x.l}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={Card()}>
+                <div style={{ color:"#93c5fd", fontSize:"0.82rem", fontWeight:"700", marginBottom:"12px" }}>💡 معلومات الصندوق</div>
+                {[["قيمة الاشتراك الحالية",fmt(curRate)],["الرصيد الافتتاحي",fmt(openingBal)],["عدد الأعضاء النشطين",`${activeMembers.length} عضو`],["السداسي الحالي",semLabel(CY(),CS())]].map(([l,v])=>(
+                  <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"7px 0", borderBottom:"1px solid #0d1f35", fontSize:"0.78rem" }}>
+                    <span style={{ color:"#4a6fa5" }}>{l}</span>
+                    <span style={{ color:"#e2e8f0", fontWeight:"700" }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {user.role!=="public" && (
+              <div style={{ ...Card("#1e3a5f"), marginBottom:"18px" }}>
+                <p style={{ color:"#1e3a5f", fontSize:"0.7rem", marginBottom:"8px" }}>⚡ إجراءات سريعة</p>
+                <div style={{ display:"flex", gap:"7px", flexWrap:"wrap" }}>
+                  {perms.canAddMember   && <button onClick={()=>{ setSelMem(null); setModal("addMember"); }} style={Btn("#4ade80",true)}>➕ عضو</button>}
+                  {perms.canAddPayment  && <button onClick={()=>{ setSelMem(null); setModal("addPayment"); }} style={Btn("#38bdf8",true)}>💳 دفعة</button>}
+                  {perms.canAddDonation && <button onClick={()=>setModal("addDonation")} style={Btn("#a78bfa",true)}>🎁 تبرع</button>}
+                  {perms.canAddExpense  && <button onClick={()=>setModal("addExpense")} style={Btn("#f87171",true)}>📤 مصروف</button>}
+                  {perms.canExempt      && <button onClick={()=>{ setSelMem(null); setModal("addExemption"); }} style={Btn("#94a3b8",true)}>⚪ إعفاء</button>}
+                </div>
+              </div>
+            )}
+
+            <div style={Card()}>
+              <div style={{ color:"#93c5fd", fontSize:"0.82rem", fontWeight:"700", marginBottom:"12px" }}>حالة الأعضاء — {semLabel(filterS.year,filterS.semester)}</div>
+              <div style={{ overflowX:"auto" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse" }}>
+                  <thead><tr>{["الاسم","المديونية التراكمية","الحالة"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+                  <tbody>
+                    {memberRows.map((m,i)=>(
+                      <tr key={m.id} style={{ cursor:"pointer" }} onClick={()=>{ setSelMem(m); setModal("memberDetail"); }}>
+                        <td style={TD(i)}><span style={{ color:"#93c5fd",fontWeight:"700" }}>{m.name}</span><div style={{ fontSize:"0.67rem",color:"#334155" }}>{m.location}</div></td>
+                        <td style={TD(i)}><span style={{ color:m.totalDebt>0?"#f87171":"#4ade80",fontWeight:"700" }}>{m.totalDebt>0?fmt(m.totalDebt):"✅ لا ديون"}</span></td>
+                        <td style={TD(i)}><Badge status={m.status}/></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* MEMBERS */}
+        {view==="members" && (
+          <div className="fade">
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"16px", flexWrap:"wrap", gap:"8px" }}>
+              <div><h2 style={{ fontSize:"1.1rem",color:"#f1f5f9",fontWeight:"900" }}>👥 سجل الأعضاء</h2><p style={{ color:"#1e3a5f",fontSize:"0.72rem" }}>{activeMembers.length} عضو نشط</p></div>
+              <div style={{ display:"flex", gap:"6px", flexWrap:"wrap" }}>
+                <input style={{ ...inp,width:"180px" }} placeholder="🔍 بحث..." value={search} onChange={e=>setSearch(e.target.value)}/>
+                <select style={{ ...inp,width:"auto" }} value={`${filterS.year}-${filterS.semester}`} onChange={e=>{ const [y,s]=e.target.value.split("-"); setFilterS({year:Number(y),semester:Number(s)}); }}>
+                  {semesters.filter(s=>s.year<=CY()+1).map(s=>(<option key={`${s.year}-${s.semester}`} value={`${s.year}-${s.semester}`}>{s.label}</option>))}
+                </select>
+                {perms.canAddMember && <button onClick={()=>{ setSelMem(null); setModal("addMember"); }} style={Btn("#4ade80",true)}>➕ عضو جديد</button>}
+              </div>
+            </div>
+            <div style={{ ...Card(),overflowX:"auto" }}>
+              <table style={{ width:"100%",borderCollapse:"collapse" }}>
+                <thead><tr>{["الاسم","الإقامة","الهاتف","انضم","المدفوع","المديونية","الحالة",...(user.role!=="public"?["إجراءات"]:[])].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {memberRows.map((m,i)=>{
+                    const ex=exemptions.find(e=>e.member_id===m.id&&e.year===filterS.year&&e.semester===filterS.semester);
+                    return (
+                      <tr key={m.id}>
+                        <td style={TD(i)}><span style={{ color:"#93c5fd",cursor:"pointer",fontWeight:"700" }} onClick={()=>{ setSelMem(m); setModal("memberDetail"); }}>{m.name}</span></td>
+                        <td style={{ ...TD(i),color:"#334155",fontSize:"0.78rem" }}>{m.location}</td>
+                        <td style={{ ...TD(i),color:"#334155",fontSize:"0.75rem",direction:"ltr",textAlign:"right" }}>{m.phone}</td>
+                        <td style={{ ...TD(i),color:"#334155",fontSize:"0.72rem" }}>{semLabel(m.join_year,m.join_semester)}</td>
+                        <td style={TD(i)}>
+                          <span style={{ color:"#e2e8f0",fontSize:"0.82rem" }}>{fmt(m.semPaid)}</span>
+                          {m.status==="partial"&&<div style={{ fontSize:"0.67rem",color:"#fbbf24" }}>متبقي: {fmt(getSubRate(filterS.year,filterS.semester,rates)-m.semPaid)}</div>}
+                          {ex&&<div style={{ fontSize:"0.63rem",color:"#94a3b8" }}>إعفاء: {ex.reason}</div>}
+                        </td>
+                        <td style={TD(i)}><span style={{ color:m.totalDebt>0?"#f87171":"#4ade80",fontWeight:"700",fontSize:"0.8rem" }}>{m.totalDebt>0?fmt(m.totalDebt):"✅"}</span></td>
+                        <td style={TD(i)}><Badge status={m.status}/></td>
+                        {user.role!=="public"&&(
+                          <td style={TD(i)}>
+                            <div style={{ display:"flex",gap:"3px",flexWrap:"wrap" }}>
+                              <button onClick={()=>{ setSelMem(m); setModal("memberDetail"); }} style={{ ...Btn("#475569",true),padding:"3px 6px" }} title="تفاصيل">👁️</button>
+                              {perms.canEditMember    && <button onClick={()=>{ setSelMem(m); setModal("editMember"); }}   style={{ ...Btn("#38bdf8",true),padding:"3px 6px" }} title="تعديل">✏️</button>}
+                              {perms.canAddPayment    && <button onClick={()=>{ setSelMem(m); setModal("addPayment"); }}   style={{ ...Btn("#4ade80",true),padding:"3px 6px" }} title="دفعة">💳</button>}
+                              {perms.canExempt&&!ex   && <button onClick={()=>{ setSelMem(m); setModal("addExemption"); }} style={{ ...Btn("#94a3b8",true),padding:"3px 6px" }} title="إعفاء">⚪</button>}
+                              {perms.canExempt&&ex    && <button onClick={()=>removeExemption(ex)}                        style={{ ...Btn("#fbbf24",true),padding:"3px 6px" }} title="إلغاء الإعفاء">🔄</button>}
+                              {perms.canArchiveMember && <button onClick={()=>archiveMember(m)}                           style={{ ...Btn("#f59e0b",true),padding:"3px 6px" }} title="أرشفة">🗄️</button>}
+                              {perms.canDeleteMember  && <button onClick={()=>deleteMember(m)}                            style={{ ...Btn("#ef4444",true),padding:"3px 6px" }} title="حذف نهائي">🗑️</button>}
+                            </div>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* EXPENSES */}
+        {view==="expenses" && (
+          <div className="fade">
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"16px",flexWrap:"wrap",gap:"8px" }}>
+              <div><h2 style={{ fontSize:"1.1rem",color:"#f1f5f9",fontWeight:"900" }}>💸 سجل المصاريف</h2><p style={{ color:"#1e3a5f",fontSize:"0.72rem" }}>إجمالي: {fmt(totalExp)}</p></div>
+              {perms.canAddExpense&&<button onClick={()=>setModal("addExpense")} style={Btn("#f87171",true)}>➕ تسجيل مصروف</button>}
+            </div>
+            <div style={{ ...Card(),overflowX:"auto" }}>
+              <table style={{ width:"100%",borderCollapse:"collapse" }}>
+                <thead><tr>{["التاريخ","المناسبة","المستفيد","المبلغ","ملاحظات",...(perms.canDelete?["حذف"]:[])].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {expenses.map((e,i)=>(
+                    <tr key={e.id}>
+                      <td style={{ ...TD(i),color:"#334155",fontSize:"0.75rem" }}>{fmtDate(e.date)}</td>
+                      <td style={TD(i)}><span style={{ background:"#0d1f35",color:"#93c5fd",padding:"2px 8px",borderRadius:"20px",fontSize:"0.7rem" }}>{e.type==="زواج"?"💍":e.type==="جنازة"?"🕌":e.type==="مساعدة مرض"?"🏥":"📌"} {e.type}</span></td>
+                      <td style={{ ...TD(i),color:"#e2e8f0",fontWeight:"700" }}>{e.beneficiary}</td>
+                      <td style={{ ...TD(i),color:"#f87171",fontWeight:"900" }}>{fmt(e.amount)}</td>
+                      <td style={{ ...TD(i),color:"#334155",fontSize:"0.72rem" }}>{e.note}</td>
+                      {perms.canDelete&&<td style={TD(i)}><button onClick={()=>deleteExpense(e)} style={{ ...Btn("#f87171",true),padding:"3px 7px" }}>🗑️</button></td>}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* DONATIONS */}
+        {view==="donations" && (
+          <div className="fade">
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"16px",flexWrap:"wrap",gap:"8px" }}>
+              <div><h2 style={{ fontSize:"1.1rem",color:"#f1f5f9",fontWeight:"900" }}>🎁 سجل التبرعات</h2><p style={{ color:"#1e3a5f",fontSize:"0.72rem" }}>إجمالي: {fmt(totalDon)}</p></div>
+              {perms.canAddDonation&&<button onClick={()=>setModal("addDonation")} style={Btn("#a78bfa",true)}>➕ تسجيل تبرع</button>}
+            </div>
+            <div style={{ ...Card(),overflowX:"auto" }}>
+              <table style={{ width:"100%",borderCollapse:"collapse" }}>
+                <thead><tr>{["التاريخ","المتبرع","النوع","المبلغ","ملاحظات",...(perms.canDelete?["حذف"]:[])].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {donations.map((d,i)=>(
+                    <tr key={d.id}>
+                      <td style={{ ...TD(i),color:"#334155",fontSize:"0.75rem" }}>{fmtDate(d.date)}</td>
+                      <td style={{ ...TD(i),color:"#e2e8f0",fontWeight:"700" }}>{d.donor_name}</td>
+                      <td style={TD(i)}><span style={{ fontSize:"0.7rem",color:d.member_id?"#a78bfa":"#38bdf8",background:d.member_id?"#1e1b4b":"#0c1a30",padding:"2px 8px",borderRadius:"20px" }}>{d.member_id?"👤 عضو":"🌍 خارج العرش"}</span></td>
+                      <td style={{ ...TD(i),color:"#a78bfa",fontWeight:"900" }}>{fmt(d.amount)}</td>
+                      <td style={{ ...TD(i),color:"#334155",fontSize:"0.72rem" }}>{d.note}</td>
+                      {perms.canDelete&&<td style={TD(i)}><button onClick={()=>deleteDonation(d)} style={{ ...Btn("#f87171",true),padding:"3px 7px" }}>🗑️</button></td>}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ARCHIVE */}
+        {view==="archive" && (
+          <div className="fade">
+            <h2 style={{ fontSize:"1.1rem",color:"#f1f5f9",fontWeight:"900",marginBottom:"16px" }}>🗄️ أرشيف الأعضاء</h2>
+            <div style={{ ...Card(),overflowX:"auto" }}>
+              <table style={{ width:"100%",borderCollapse:"collapse" }}>
+                <thead><tr>{["الاسم","الإقامة","الهاتف","انضم","إجمالي ما دفع"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {members.filter(m=>m.status==="archived").map((m,i)=>{
+                    const total=payments.filter(p=>p.member_id===m.id).reduce((s,p)=>s+p.base,0);
+                    return(<tr key={m.id}><td style={{ ...TD(i),color:"#475569" }}>{m.name}</td><td style={{ ...TD(i),color:"#334155",fontSize:"0.78rem" }}>{m.location}</td><td style={{ ...TD(i),color:"#334155",fontSize:"0.75rem" }}>{m.phone}</td><td style={{ ...TD(i),color:"#334155",fontSize:"0.72rem" }}>{semLabel(m.join_year,m.join_semester)}</td><td style={{ ...TD(i),color:"#475569" }}>{fmt(total)}</td></tr>);
+                  })}
+                  {!members.filter(m=>m.status==="archived").length&&<tr><td colSpan="5" style={{ textAlign:"center",padding:"30px",color:"#1e3a5f" }}>لا يوجد أعضاء في الأرشيف</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* YEARLY */}
+        {view==="yearly"&&perms.canExportPDF&&(
+          <div className="fade">
+            <h2 style={{ fontSize:"1.1rem",color:"#f1f5f9",fontWeight:"900",marginBottom:"16px" }}>📊 التقرير السنوي المقارن</h2>
+            <div style={{ ...Card(),overflowX:"auto" }}>
+              <table style={{ width:"100%",borderCollapse:"collapse" }}>
+                <thead><tr>{["السنة","الاشتراكات","التبرعات","المصاريف","الصافي"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {Array.from(new Set([...payments.map(p=>new Date(p.date).getFullYear()),...expenses.map(e=>new Date(e.date).getFullYear())])).sort((a,b)=>b-a).map((y,i)=>{
+                    const yP=payments.filter(p=>new Date(p.date).getFullYear()===y).reduce((s,p)=>s+p.base,0);
+                    const yD=donations.filter(d=>new Date(d.date).getFullYear()===y).reduce((s,d)=>s+d.amount,0);
+                    const yE=expenses.filter(e=>new Date(e.date).getFullYear()===y).reduce((s,e)=>s+e.amount,0);
+                    return(<tr key={y}><td style={{ ...TD(i),color:"#93c5fd",fontWeight:"900" }}>{y}</td><td style={{ ...TD(i),color:"#38bdf8" }}>{fmt(yP)}</td><td style={{ ...TD(i),color:"#a78bfa" }}>{fmt(yD)}</td><td style={{ ...TD(i),color:"#f87171" }}>{fmt(yE)}</td><td style={{ ...TD(i),color:yP+yD-yE>=0?"#4ade80":"#f87171",fontWeight:"900" }}>{fmt(yP+yD-yE)}</td></tr>);
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* AUDIT */}
+        {view==="audit"&&perms.canExportPDF&&(
+          <div className="fade">
+            <h2 style={{ fontSize:"1.1rem",color:"#f1f5f9",fontWeight:"900",marginBottom:"16px" }}>📋 سجل التعديلات</h2>
+            <div style={Card()}>
+              {auditLog.map((a,i)=>(
+                <div key={a.id} style={{ display:"flex",gap:"12px",padding:"10px 0",borderBottom:i<auditLog.length-1?"1px solid #060c18":"none",alignItems:"flex-start" }}>
+                  <div style={{ fontSize:"0.65rem",color:"#1e3a5f",whiteSpace:"nowrap",minWidth:"100px" }}>{fmtDate(a.created_at)}</div>
+                  <div style={{ fontSize:"0.7rem",color:"#38bdf8",whiteSpace:"nowrap",minWidth:"75px" }}>{a.user_label}</div>
+                  <div style={{ fontSize:"0.8rem",color:"#94a3b8" }}>{a.action}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* MODALS */}
+      {modal==="memberDetail"&&selMem&&<MemberDetailModal member={selMem} payments={payments} exemptions={exemptions} rates={rates} semesters={semesters} fmt={fmt} fmtDate={fmtDate} semLabel={semLabel} getMemberSemPaid={getMemberSemPaid} getMemberStatus={getMemberStatus} onClose={()=>setModal(null)} onDeletePayment={perms.canDelete?deletePayment:null}/>}
+      {modal==="addMember"&&<MemberFormModal title="إضافة عضو جديد" onClose={()=>setModal(null)} onSave={addMember} semesters={semesters} CY={CY} CS={CS} saving={saving}/>}
+      {modal==="editMember"&&selMem&&<MemberFormModal title={`تعديل: ${selMem.name}`} initial={selMem} onClose={()=>setModal(null)} onSave={editMember} semesters={semesters} CY={CY} CS={CS} saving={saving}/>}
+      {modal==="addPayment"&&<PaymentFormModal members={activeMembers} semesters={semesters} preselected={selMem} onClose={()=>setModal(null)} onSave={addPayment} CY={CY} CS={CS} fmt={fmt} rates={rates} saving={saving}/>}
+      {modal==="addDonation"&&<DonationFormModal members={activeMembers} onClose={()=>setModal(null)} onSave={addDonation} saving={saving}/>}
+      {modal==="addExpense"&&<ExpenseFormModal onClose={()=>setModal(null)} onSave={addExpense} fmt={fmt} saving={saving}/>}
+      {modal==="addExemption"&&<ExemptionFormModal members={activeMembers} semesters={semesters} preselected={selMem} onClose={()=>setModal(null)} onSave={addExemption} CY={CY} CS={CS} saving={saving}/>}
+      {modal==="settings"&&<SettingsModal openingBal={openingBal} curRate={curRate} rates={rates} semesters={semesters} CY={CY} CS={CS} onClose={()=>setModal(null)} onSave={saveSettings} fmt={fmt} saving={saving}/>}
+      {confirm&&<Confirm msg={confirm.msg} danger={confirm.danger} onYes={confirm.onYes} onNo={()=>setConfirm(null)}/>}
+
+      <footer style={{ textAlign:"center",padding:"20px",color:"#0d1f35",fontSize:"0.65rem",borderTop:"1px solid #060c18",marginTop:"16px" }}>
+        صندوق التكافل الاجتماعي — عرش بديده © {CY()}
+      </footer>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════
+// FORM MODALS
+// ═══════════════════════════════════════════════
+function MemberDetailModal({ member, payments, exemptions, rates, semesters, fmt, fmtDate, semLabel, getMemberSemPaid, getMemberStatus, onClose, onDeletePayment }) {
+  const memPay=payments.filter(p=>p.member_id===member.id);
+  const total=memPay.reduce((s,p)=>s+p.base,0);
+  const curY=CY(),curS=CS();
+  const rel=semesters.filter(s=>{ if(s.year>curY) return false; if(s.year===curY&&s.semester>curS) return false; if(s.year<member.join_year) return false; if(s.year===member.join_year&&s.semester<member.join_semester) return false; return true; }).reverse();
+  const c2={ padding:"7px 10px",fontSize:"0.75rem",borderBottom:"1px solid #060c18" };
+  return (
+    <Modal title={`ملف: ${member.name}`} onClose={onClose} wide>
+      <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"16px" }}>
+        {[["📍",member.location||"—"],["📞",member.phone||"—"],["📅",semLabel(member.join_year,member.join_semester)],["💰",fmt(total)]].map(([l,v])=>(
+          <div key={l} style={{ background:"#060c18",borderRadius:"7px",padding:"9px 11px" }}>
+            <div style={{ color:"#1e3a5f",fontSize:"0.65rem" }}>{l}</div>
+            <div style={{ color:"#e2e8f0",fontSize:"0.82rem",fontWeight:"700",marginTop:"2px" }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ color:"#4a6fa5",fontSize:"0.72rem",marginBottom:"7px",fontWeight:"600" }}>سجل السداسيات</div>
+      <div style={{ overflowX:"auto",marginBottom:"16px" }}>
+        <table style={{ width:"100%",borderCollapse:"collapse" }}>
+          <thead><tr>{["السداسي","المدفوع","الحالة"].map(h=><th key={h} style={{ ...TH,background:"#04090f" }}>{h}</th>)}</tr></thead>
+          <tbody>
+            {rel.map((s,i)=>{
+              const paid=getMemberSemPaid(member.id,s.year,s.semester,payments);
+              const st=getMemberStatus(member,s.year,s.semester,payments,exemptions,rates);
+              const stI=STATUS[st];
+              return(<tr key={`${s.year}-${s.semester}`}><td style={{ ...c2,color:"#64748b",background:i%2===0?"#080e1c":"#060c18" }}>{s.label}</td><td style={{ ...c2,color:"#e2e8f0",background:i%2===0?"#080e1c":"#060c18" }}>{fmt(paid)}</td><td style={{ ...c2,background:i%2===0?"#080e1c":"#060c18" }}><span style={{ color:stI.color,fontSize:"0.72rem" }}>{stI.emoji} {stI.label}</span></td></tr>);
+            })}
+          </tbody>
+        </table>
+      </div>
+      {memPay.length>0&&(
+        <>
+          <div style={{ color:"#4a6fa5",fontSize:"0.72rem",marginBottom:"7px",fontWeight:"600" }}>تفاصيل الدفعات</div>
+          <table style={{ width:"100%",borderCollapse:"collapse" }}>
+            <thead><tr>{["التاريخ","السداسي","المبلغ",...(onDeletePayment?["حذف"]:[])].map(h=><th key={h} style={{ ...TH,background:"#04090f" }}>{h}</th>)}</tr></thead>
+            <tbody>
+              {memPay.map((p,i)=>(
+                <tr key={p.id}>
+                  <td style={{ ...c2,color:"#475569",background:i%2===0?"#080e1c":"#060c18" }}>{fmtDate(p.date)}</td>
+                  <td style={{ ...c2,color:"#475569",background:i%2===0?"#080e1c":"#060c18" }}>{semLabel(p.year,p.semester)}</td>
+                  <td style={{ padding:"7px 10px",color:"#4ade80",fontWeight:"700",borderBottom:"1px solid #060c18",background:i%2===0?"#080e1c":"#060c18" }}>{fmt(p.base)}</td>
+                  {onDeletePayment&&<td style={{ padding:"7px 10px",borderBottom:"1px solid #060c18",background:i%2===0?"#080e1c":"#060c18" }}><button onClick={()=>onDeletePayment(p)} style={{ background:"#3b0a0a",border:"1px solid #ef444433",color:"#f87171",padding:"2px 7px",borderRadius:"4px",cursor:"pointer",fontSize:"0.7rem" }}>🗑️</button></td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function MemberFormModal({ title, initial, onClose, onSave, semesters, CY, CS, saving }) {
+  const [f,setF]=useState(initial?{name:initial.name,phone:initial.phone||"",location:initial.location||"",join_year:initial.join_year,join_semester:initial.join_semester}:{name:"",phone:"",location:"",join_year:CY(),join_semester:CS()});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  return(
+    <Modal title={title} onClose={onClose}>
+      <Field label="الاسم الكامل *"><input style={inp} value={f.name} onChange={e=>set("name",e.target.value)} placeholder="أدخل الاسم الكامل"/></Field>
+      <Field label="رقم الهاتف"><input style={inp} value={f.phone} onChange={e=>set("phone",e.target.value)} placeholder="0661234567"/></Field>
+      <Field label="مكان الإقامة"><input style={inp} value={f.location} onChange={e=>set("location",e.target.value)} placeholder="بديدة الوسط"/></Field>
+      <Field label="سداسي الانضمام">
+        <select style={inp} value={`${f.join_year}-${f.join_semester}`} onChange={e=>{ const [y,s]=e.target.value.split("-"); set("join_year",Number(y)); set("join_semester",Number(s)); }}>
+          {semesters.filter(s=>s.year<=CY()).map(s=>(<option key={`${s.year}-${s.semester}`} value={`${s.year}-${s.semester}`}>{s.label}</option>))}
+        </select>
+      </Field>
+      <button onClick={()=>f.name.trim()&&onSave(f)} disabled={saving} style={{ ...Btn("#4ade80"),width:"100%",justifyContent:"center",opacity:saving?0.6:1 }}>{saving?"جاري الحفظ...":"حفظ"}</button>
+    </Modal>
+  );
+}
+
+function PaymentFormModal({ members, semesters, preselected, onClose, onSave, CY, CS, fmt, rates, saving }) {
+  const [f,setF]=useState({member_id:preselected?.id||"",year:CY(),semester:CS(),base:2000,date:new Date().toISOString().slice(0,10)});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const curRate=getSubRate(f.year,f.semester,rates);
+  return(
+    <Modal title="تسجيل دفعة" onClose={onClose}>
+      <Field label="العضو *"><select style={inp} value={f.member_id} onChange={e=>set("member_id",Number(e.target.value))}><option value="">-- اختر العضو --</option>{members.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select></Field>
+      <Field label="السداسي *"><select style={inp} value={`${f.year}-${f.semester}`} onChange={e=>{ const [y,s]=e.target.value.split("-"); set("year",Number(y)); set("semester",Number(s)); }}>{semesters.filter(s=>s.year<=CY()).map(s=>(<option key={`${s.year}-${s.semester}`} value={`${s.year}-${s.semester}`}>{s.label}</option>))}</select></Field>
+      <Field label={`المبلغ — الحد الأدنى: ${curRate.toLocaleString("ar-DZ")} دج`}><input style={inp} type="number" min="1" value={f.base} onChange={e=>set("base",e.target.value)}/></Field>
+      <Field label="تاريخ الدفع"><input style={inp} type="date" value={f.date} onChange={e=>set("date",e.target.value)}/></Field>
+      <div style={{ background:"#060c18",borderRadius:"7px",padding:"10px",marginBottom:"12px" }}>
+        <div style={{ color:"#1e3a5f",fontSize:"0.7rem" }}>إجمالي الدفعة</div>
+        <div style={{ color:"#38bdf8",fontSize:"1.1rem",fontWeight:"900",marginTop:"3px" }}>{fmt(Number(f.base))}</div>
+        {Number(f.base)>=curRate?<div style={{ color:"#4ade80",fontSize:"0.68rem" }}>✅ يغطي الحد الأدنى</div>:<div style={{ color:"#fbbf24",fontSize:"0.68rem" }}>⚠️ أقل من الحد الأدنى</div>}
+      </div>
+      <button onClick={()=>f.member_id&&f.base>0&&onSave(f)} disabled={saving} style={{ ...Btn("#38bdf8"),width:"100%",justifyContent:"center",opacity:saving?0.6:1 }}>{saving?"جاري الحفظ...":"تسجيل الدفعة"}</button>
+    </Modal>
+  );
+}
+
+function DonationFormModal({ members, onClose, onSave, saving }) {
+  const [f,setF]=useState({member_id:"",donor_name:"",amount:"",date:new Date().toISOString().slice(0,10),note:"",isExternal:false});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  return(
+    <Modal title="تسجيل تبرع" onClose={onClose}>
+      <Field label="نوع المتبرع">
+        <div style={{ display:"flex",gap:"7px" }}>
+          {[["false","👤 عضو"],["true","🌍 خارج العرش"]].map(([v,l])=>(
+            <button key={v} onClick={()=>set("isExternal",v==="true")} style={{ flex:1,padding:"8px",borderRadius:"7px",cursor:"pointer",background:String(f.isExternal)===v?"#1d4ed8":"#0d1f35",border:`1px solid ${String(f.isExternal)===v?"#3b82f6":"#1e3a5f"}`,color:String(f.isExternal)===v?"#fff":"#4a6fa5",fontSize:"0.78rem",fontFamily:"'Tajawal',sans-serif" }}>{l}</button>
+          ))}
+        </div>
+      </Field>
+      {!f.isExternal&&<Field label="العضو"><select style={inp} value={f.member_id} onChange={e=>{ set("member_id",Number(e.target.value)); const m=members.find(x=>x.id===Number(e.target.value)); if(m) set("donor_name",m.name); }}><option value="">-- اختر العضو --</option>{members.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select></Field>}
+      <Field label="اسم المتبرع *"><input style={inp} value={f.donor_name} onChange={e=>set("donor_name",e.target.value)} placeholder="اسم المتبرع"/></Field>
+      <Field label="المبلغ (دج) *"><input style={inp} type="number" min="1" value={f.amount} onChange={e=>set("amount",e.target.value)}/></Field>
+      <Field label="التاريخ"><input style={inp} type="date" value={f.date} onChange={e=>set("date",e.target.value)}/></Field>
+      <Field label="ملاحظات"><input style={inp} value={f.note} onChange={e=>set("note",e.target.value)} placeholder="تفاصيل..."/></Field>
+      <button onClick={()=>f.donor_name&&f.amount>0&&onSave({member_id:f.isExternal?null:(f.member_id||null),donor_name:f.donor_name,amount:Number(f.amount),date:f.date,note:f.note})} disabled={saving} style={{ ...Btn("#a78bfa"),width:"100%",justifyContent:"center",opacity:saving?0.6:1 }}>{saving?"جاري الحفظ...":"تسجيل التبرع"}</button>
+    </Modal>
+  );
+}
+
+function ExpenseFormModal({ onClose, onSave, fmt, saving }) {
+  const [f,setF]=useState({date:new Date().toISOString().slice(0,10),type:"زواج",beneficiary:"",amount:"",note:""});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  return(
+    <Modal title="تسجيل مصروف" onClose={onClose}>
+      <Field label="التاريخ *"><input style={inp} type="date" value={f.date} onChange={e=>set("date",e.target.value)}/></Field>
+      <Field label="نوع المناسبة *"><select style={inp} value={f.type} onChange={e=>set("type",e.target.value)}>{["زواج","جنازة","مساعدة مرض","كارثة طبيعية","أخرى"].map(t=><option key={t} value={t}>{t}</option>)}</select></Field>
+      <Field label="اسم المستفيد *"><input style={inp} value={f.beneficiary} onChange={e=>set("beneficiary",e.target.value)} placeholder="من استلم المبلغ"/></Field>
+      <Field label="المبلغ (دج) *"><input style={inp} type="number" min="1" value={f.amount} onChange={e=>set("amount",e.target.value)}/></Field>
+      <Field label="ملاحظات"><input style={inp} value={f.note} onChange={e=>set("note",e.target.value)} placeholder="تفاصيل..."/></Field>
+      {f.amount>0&&<div style={{ background:"#3b0a0a",border:"1px solid #ef444433",borderRadius:"7px",padding:"9px",marginBottom:"11px",fontSize:"0.76rem",color:"#fca5a5" }}>⚠️ سيتم خصم {fmt(Number(f.amount))} من الرصيد</div>}
+      <button onClick={()=>f.beneficiary&&f.amount>0&&onSave(f)} disabled={saving} style={{ ...Btn("#f87171"),width:"100%",justifyContent:"center",opacity:saving?0.6:1 }}>{saving?"جاري الحفظ...":"تسجيل المصروف"}</button>
+    </Modal>
+  );
+}
+
+function ExemptionFormModal({ members, semesters, preselected, onClose, onSave, CY, CS, saving }) {
+  const [f,setF]=useState({member_id:preselected?.id||"",year:CY(),semester:CS(),reason:""});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  return(
+    <Modal title="منح إعفاء" onClose={onClose}>
+      <div style={{ background:"#1c1a05",border:"1px solid #f59e0b44",borderRadius:"7px",padding:"9px 12px",marginBottom:"12px",fontSize:"0.76rem",color:"#fbbf24" }}>⚠️ الإعفاء لسداسي واحد فقط</div>
+      <Field label="العضو *"><select style={inp} value={f.member_id} onChange={e=>set("member_id",Number(e.target.value))}><option value="">-- اختر العضو --</option>{members.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select></Field>
+      <Field label="السداسي *"><select style={inp} value={`${f.year}-${f.semester}`} onChange={e=>{ const [y,s]=e.target.value.split("-"); set("year",Number(y)); set("semester",Number(s)); }}>{semesters.filter(s=>s.year<=CY()).map(s=>(<option key={`${s.year}-${s.semester}`} value={`${s.year}-${s.semester}`}>{s.label}</option>))}</select></Field>
+      <Field label="سبب الإعفاء *"><input style={inp} value={f.reason} onChange={e=>set("reason",e.target.value)} placeholder="مثال: مريض، وثيقة طبية"/></Field>
+      <button onClick={()=>f.member_id&&f.reason.trim()&&onSave(f)} disabled={saving} style={{ ...Btn("#94a3b8"),width:"100%",justifyContent:"center",opacity:saving?0.6:1 }}>{saving?"جاري الحفظ...":"منح الإعفاء"}</button>
+    </Modal>
+  );
+}
+
+function SettingsModal({ openingBal, curRate, rates, semesters, CY, CS, onClose, onSave, fmt, saving }) {
+  const [f,setF]=useState({opening:openingBal,newRate:curRate,rateYear:CY(),rateSem:CS(),rateNote:""});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  return(
+    <Modal title="⚙️ إعدادات الصندوق" onClose={onClose} wide>
+      <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:"18px" }}>
+        <div>
+          <div style={{ color:"#93c5fd",fontSize:"0.8rem",fontWeight:"700",marginBottom:"12px" }}>💰 الرصيد الافتتاحي</div>
+          <Field label="المبلغ (دج)"><input style={inp} type="number" value={f.opening} onChange={e=>set("opening",e.target.value)}/></Field>
+          <p style={{ color:"#1e3a5f",fontSize:"0.68rem" }}>مبالغ جُمعت قبل تشغيل النظام</p>
+        </div>
+        <div>
+          <div style={{ color:"#93c5fd",fontSize:"0.8rem",fontWeight:"700",marginBottom:"12px" }}>📋 قيمة الاشتراك</div>
+          <div style={{ background:"#060c18",borderRadius:"7px",padding:"9px",marginBottom:"10px" }}>
+            <div style={{ fontSize:"0.68rem",color:"#1e3a5f" }}>الحالية</div>
+            <div style={{ fontSize:"1rem",fontWeight:"900",color:"#4ade80" }}>{fmt(curRate)}</div>
+          </div>
+          <Field label="القيمة الجديدة (دج)"><input style={inp} type="number" value={f.newRate} onChange={e=>set("newRate",e.target.value)}/></Field>
+          <Field label="تاريخ التطبيق"><select style={inp} value={`${f.rateYear}-${f.rateSem}`} onChange={e=>{ const [y,s]=e.target.value.split("-"); set("rateYear",Number(y)); set("rateSem",Number(s)); }}>{semesters.filter(s=>s.year>=CY()).slice(0,10).map(s=>(<option key={`${s.year}-${s.semester}`} value={`${s.year}-${s.semester}`}>{s.label}</option>))}</select></Field>
+          <Field label="سبب التعديل"><input style={inp} value={f.rateNote} onChange={e=>set("rateNote",e.target.value)} placeholder="مثال: تعديل بسبب التضخم"/></Field>
+        </div>
+      </div>
+      <div style={{ marginTop:"12px",padding:"10px",background:"#060c18",borderRadius:"7px",marginBottom:"14px" }}>
+        <div style={{ color:"#4a6fa5",fontSize:"0.7rem",marginBottom:"7px" }}>تاريخ قيم الاشتراك</div>
+        {rates.map(r=>(<div key={r.id} style={{ display:"flex",gap:"10px",fontSize:"0.72rem",color:"#334155",padding:"3px 0",borderBottom:"1px solid #0d1f35" }}><span style={{ color:"#93c5fd" }}>{r.amount.toLocaleString("ar-DZ")} دج</span><span>من س{r.effective_semester===1?"١":"٢"} {r.effective_year}</span><span style={{ color:"#1e3a5f" }}>{r.note}</span></div>))}
+      </div>
+      <button onClick={()=>onSave(f)} disabled={saving} style={{ ...Btn("#4ade80"),width:"100%",justifyContent:"center",opacity:saving?0.6:1 }}>{saving?"جاري الحفظ...":"حفظ الإعدادات"}</button>
+    </Modal>
+  );
+}
